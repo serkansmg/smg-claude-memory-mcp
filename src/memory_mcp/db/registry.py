@@ -14,17 +14,36 @@ _registry_lock = threading.Lock()
 
 
 def _get_registry() -> duckdb.DuckDBPyConnection:
-    """Get or create the registry database connection."""
+    """Get or create the registry database connection with retry logic."""
     global _registry_conn
     if _registry_conn is not None:
-        return _registry_conn
+        # Verify connection is alive
+        try:
+            _registry_conn.execute("SELECT 1")
+            return _registry_conn
+        except Exception:
+            _registry_conn = None
+
     with _registry_lock:
         if _registry_conn is not None:
-            return _registry_conn
+            try:
+                _registry_conn.execute("SELECT 1")
+                return _registry_conn
+            except Exception:
+                _registry_conn = None
+
         settings.ensure_dirs()
-        _registry_conn = duckdb.connect(str(settings.registry_path))
-        create_registry_schema(_registry_conn)
-        return _registry_conn
+        import time
+        for attempt in range(3):
+            try:
+                _registry_conn = duckdb.connect(str(settings.registry_path))
+                create_registry_schema(_registry_conn)
+                return _registry_conn
+            except duckdb.IOException:
+                if attempt < 2:
+                    time.sleep(0.3 * (attempt + 1))
+                else:
+                    raise
 
 
 def register_project(slug: str, display_name: str, description: str | None = None) -> ProjectInfo:

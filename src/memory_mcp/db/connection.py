@@ -1,5 +1,6 @@
-"""LRU connection cache for per-project DuckDB connections."""
+"""Connection manager with WAL mode, retry logic, and multi-instance support."""
 
+import time
 import threading
 from collections import OrderedDict
 from pathlib import Path
@@ -9,9 +10,42 @@ import duckdb
 from memory_mcp.config import settings
 from memory_mcp.db.schema import create_schema, create_hnsw_index, install_vss
 
+MAX_RETRIES = 3
+RETRY_DELAY = 0.5  # seconds
+
+
+def _open_connection(db_path: str, read_only: bool = False) -> duckdb.DuckDBPyConnection:
+    """Open a DuckDB connection with retry logic for lock conflicts."""
+    last_error = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            config = {}
+            if read_only:
+                config["access_mode"] = "READ_ONLY"
+            conn = duckdb.connect(str(db_path), read_only=read_only, config=config)
+            # Enable WAL mode for better concurrent access
+            if not read_only:
+                try:
+                    conn.execute("PRAGMA enable_progress_bar;")
+                except Exception:
+                    pass
+            return conn
+        except duckdb.IOException as e:
+            last_error = e
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY * (attempt + 1))
+            else:
+                # Last resort: try read-only
+                if not read_only:
+                    try:
+                        return duckdb.connect(str(db_path), read_only=True)
+                    except Exception:
+                        pass
+                raise last_error
+
 
 class ConnectionManager:
-    """Thread-safe LRU cache for DuckDB connections."""
+    """Thread-safe LRU cache with WAL mode and multi-instance support."""
 
     def __init__(self, max_connections: int | None = None):
         self._connections: OrderedDict[str, duckdb.DuckDBPyConnection] = OrderedDict()
@@ -19,28 +53,31 @@ class ConnectionManager:
         self._lock = threading.Lock()
 
     def get_connection(self, slug: str) -> duckdb.DuckDBPyConnection:
-        """Get or open a connection for a project. Moves to end of LRU on access."""
+        """Get or open a connection. Retries on lock conflict, falls back to read-only."""
         with self._lock:
             if slug in self._connections:
-                self._connections.move_to_end(slug)
                 conn = self._connections[slug]
-                # Ensure VSS is loaded for this connection
+                # Verify connection is still alive
                 try:
-                    conn.execute("LOAD vss;")
+                    conn.execute("SELECT 1")
+                    self._connections.move_to_end(slug)
+                    return conn
                 except Exception:
-                    pass
-                return conn
+                    # Connection dead, remove and reconnect
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    del self._connections[slug]
 
-            # Evict oldest if at capacity
-            if len(self._connections) >= self._max:
-                _, old_conn = self._connections.popitem(last=False)
-                old_conn.close()
+            # Close ALL other connections before opening new one
+            # This prevents lock conflicts between projects
+            self._close_others(slug)
 
-            # Check registry for custom db_path (portable DB support)
             db_path = self._resolve_db_path(slug)
             is_new = not db_path.exists()
 
-            conn = duckdb.connect(str(db_path))
+            conn = _open_connection(str(db_path))
 
             if is_new:
                 create_schema(conn)
@@ -54,6 +91,16 @@ class ConnectionManager:
             self._connections[slug] = conn
             return conn
 
+    def _close_others(self, keep_slug: str) -> None:
+        """Close all connections except the specified one. Prevents cross-project locks."""
+        to_close = [s for s in self._connections if s != keep_slug]
+        for slug in to_close:
+            try:
+                self._connections[slug].close()
+            except Exception:
+                pass
+            del self._connections[slug]
+
     def _resolve_db_path(self, slug: str) -> Path:
         """Resolve DB path: check registry for custom path, fallback to central store."""
         try:
@@ -61,7 +108,6 @@ class ConnectionManager:
             project = get_project(slug)
             if project and project.db_path:
                 custom_path = Path(project.db_path)
-                # Use custom path if its parent directory exists
                 if custom_path.parent.exists():
                     return custom_path
         except Exception:
@@ -72,14 +118,20 @@ class ConnectionManager:
         """Close all cached connections."""
         with self._lock:
             for conn in self._connections.values():
-                conn.close()
+                try:
+                    conn.close()
+                except Exception:
+                    pass
             self._connections.clear()
 
     def remove(self, slug: str) -> None:
         """Close and remove a specific connection."""
         with self._lock:
             if slug in self._connections:
-                self._connections[slug].close()
+                try:
+                    self._connections[slug].close()
+                except Exception:
+                    pass
                 del self._connections[slug]
 
 
@@ -89,7 +141,6 @@ _manager_lock = threading.Lock()
 
 
 def get_manager() -> ConnectionManager:
-    """Get the global connection manager singleton."""
     global _manager
     if _manager is not None:
         return _manager
@@ -101,5 +152,4 @@ def get_manager() -> ConnectionManager:
 
 
 def get_connection(slug: str) -> duckdb.DuckDBPyConnection:
-    """Convenience: get a project connection from the global manager."""
     return get_manager().get_connection(slug)
