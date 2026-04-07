@@ -18,10 +18,7 @@ from memory_mcp.db.provenance import get_provenance
 from memory_mcp.tools.portable import attach_project, make_portable, sync_from_portable
 from memory_mcp.tools.export_import import export_memories, import_memories
 
-mcp = FastMCP(
-    "memory-mcp",
-    description="Production-grade vector memory server with DuckDB. Per-project semantic search, rules enforcement, session management, provenance tracking, and auto-entity extraction.",
-)
+mcp = FastMCP("memory-mcp")
 
 
 def _resolve(project: str | None) -> str:
