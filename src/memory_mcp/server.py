@@ -17,6 +17,7 @@ from memory_mcp.tools.session import session_start, session_end
 from memory_mcp.db.provenance import get_provenance
 from memory_mcp.tools.portable import attach_project, make_portable, sync_from_portable
 from memory_mcp.tools.export_import import export_memories, import_memories
+from memory_mcp.tools.model_manager import get_model_info, set_model, reembed_project
 
 mcp = FastMCP("memory-mcp")
 
@@ -463,6 +464,56 @@ def memory_import(
         project: Project slug (optional if active project is set)
     """
     return import_memories(_resolve(project), import_path)
+
+
+# --- Model Management ---
+
+
+@mcp.tool()
+def memory_model_info() -> dict:
+    """Get current embedding model info and available presets.
+
+    Shows: current model, available presets (english/multilingual),
+    disk usage, RAM usage, supported languages, and speed.
+    """
+    return get_model_info()
+
+
+@mcp.tool()
+def memory_set_model(
+    preset: str,
+    project: str | None = None,
+    confirm: bool = False,
+) -> dict:
+    """Switch embedding model between english-only and multilingual.
+
+    Presets:
+    - 'english': all-MiniLM-L6-v2 (~80MB disk, ~90MB RAM, English only, very fast)
+    - 'multilingual': paraphrase-multilingual-MiniLM-L12-v2 (~470MB disk, ~500MB RAM, 50+ languages incl. Turkish)
+
+    First call without confirm=True shows the impact (disk, RAM, re-embed count).
+    Second call with confirm=True applies the change and re-embeds existing memories.
+
+    Args:
+        preset: 'english' or 'multilingual'
+        project: If provided, re-embed this project's memories after switching
+        confirm: Must be True to proceed after reviewing the impact
+    """
+    return set_model(preset, _resolve(project) if project else None, confirm)
+
+
+@mcp.tool()
+def memory_reembed(
+    project: str | None = None,
+) -> dict:
+    """Re-embed all active memories in a project with the current model.
+
+    Use after switching embedding models to update all vectors.
+
+    Args:
+        project: Project slug (optional if active project is set)
+    """
+    return reembed_project(_resolve(project))
 
 
 def main():
