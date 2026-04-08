@@ -122,14 +122,27 @@ def migrate_v1_to_v2(conn: duckdb.DuckDBPyConnection) -> None:
 
 
 def create_hnsw_index(conn: duckdb.DuckDBPyConnection) -> None:
-    """Create HNSW vector index."""
+    """Create or recreate HNSW vector index with cosine metric."""
     try:
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_memories_embedding
-            ON memories USING HNSW (embedding)
-            WITH (metric = 'cosine')
-        """)
-    except duckdb.CatalogException:
+        # Check if index exists
+        indexes = conn.execute(
+            "SELECT index_name FROM duckdb_indexes() WHERE table_name = 'memories' AND index_name = 'idx_memories_embedding'"
+        ).fetchall()
+
+        if indexes:
+            # Drop and recreate to ensure correct metric
+            conn.execute("DROP INDEX IF EXISTS idx_memories_embedding")
+
+        # Check if there are any rows with embeddings
+        count = conn.execute("SELECT COUNT(*) FROM memories WHERE embedding IS NOT NULL").fetchone()[0]
+        if count > 0:
+            conn.execute("""
+                CREATE INDEX idx_memories_embedding
+                ON memories USING HNSW (embedding)
+                WITH (metric = 'cosine')
+            """)
+    except Exception:
+        # HNSW index is optional - search works without it (brute force)
         pass
 
 

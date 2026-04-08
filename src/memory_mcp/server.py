@@ -17,7 +17,10 @@ from memory_mcp.tools.session import session_start, session_end
 from memory_mcp.db.provenance import get_provenance
 from memory_mcp.tools.portable import attach_project, make_portable, sync_from_portable
 from memory_mcp.tools.export_import import export_memories, import_memories
-from memory_mcp.tools.model_manager import get_model_info, set_model, reembed_project
+from memory_mcp.tools.model_manager import get_model_info, set_model, reembed_project, load_persisted_model
+
+# Load persisted model config before anything else
+load_persisted_model()
 
 mcp = FastMCP("memory-mcp")
 
