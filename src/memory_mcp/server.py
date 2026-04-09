@@ -4,7 +4,7 @@ import os
 
 from fastmcp import FastMCP
 
-from memory_mcp.context import set_active_project, resolve_project
+from memory_mcp.context import set_active_project, resolve_project, load_active_project
 from memory_mcp.tools.project import init_project, list_all_projects, get_project_info
 from memory_mcp.tools.store import store_memory
 from memory_mcp.tools.recall import recall_memory
@@ -19,8 +19,9 @@ from memory_mcp.tools.portable import attach_project, make_portable, sync_from_p
 from memory_mcp.tools.export_import import export_memories, import_memories
 from memory_mcp.tools.model_manager import get_model_info, set_model, reembed_project, load_persisted_model
 
-# Load persisted model config before anything else
+# Load persisted config before anything else
 load_persisted_model()
+load_active_project()
 
 mcp = FastMCP("memory-mcp")
 
@@ -35,6 +36,26 @@ def _resolve(project: str | None) -> str:
             "or pass project= explicitly."
         )
     return slug
+
+
+# --- Version ---
+
+
+@mcp.tool()
+def memory_version() -> dict:
+    """Get the current version of the Memory MCP server and configuration."""
+    from memory_mcp import __version__
+    from memory_mcp.config import settings
+    from memory_mcp.context import _active_project
+
+    return {
+        "version": __version__,
+        "model": settings.embedding_model,
+        "model_preset": settings.model_preset,
+        "embedding_dim": settings.embedding_dim,
+        "data_dir": str(settings.data_dir),
+        "active_project": _active_project,
+    }
 
 
 # --- Active Project ---
