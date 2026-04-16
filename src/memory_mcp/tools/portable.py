@@ -4,7 +4,7 @@ import shutil
 from pathlib import Path
 
 from memory_mcp.config import settings
-from memory_mcp.db.connection import get_connection, get_manager
+from memory_mcp.db.connection import get_connection
 from memory_mcp.db.registry import register_project, get_project, touch_project
 from memory_mcp.db.schema import create_schema, create_hnsw_index, install_vss
 from memory_mcp.utils.text import slugify, validate_slug
@@ -76,8 +76,9 @@ def attach_project(
     # No existing DB - create one in central store
     project = register_project(slug, display_name, description)
 
-    # Create project DB via connection manager
-    get_connection(slug)
+    # Create project DB (opens, initializes schema, closes)
+    conn = get_connection(slug)
+    conn.close()
 
     return {
         "status": "ok",
@@ -122,8 +123,7 @@ def make_portable(project: str, project_path: str) -> dict:
             "message": "DB is already in the project directory.",
         }
 
-    # Close existing connection
-    get_manager().remove(project)
+    # No need to close - connections are per-operation now
 
     # Copy or move the DB file
     if current_db.exists():

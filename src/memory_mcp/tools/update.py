@@ -2,7 +2,7 @@
 
 import json
 
-from memory_mcp.db.connection import get_connection
+from memory_mcp.db.connection import connect
 from memory_mcp.db.queries import SELECT_MEMORY_BY_ID, row_to_dict
 from memory_mcp.db.provenance import record_provenance
 from memory_mcp.embeddings import embed_text
@@ -23,69 +23,50 @@ def update_memory(
     priority: int | None = None,
     related_ids: list[str] | None = None,
 ) -> dict:
-    """Partial update with re-embedding, re-summary, re-entity extraction, and provenance."""
-    conn = get_connection(project)
+    """Partial update with re-embedding, re-summary, re-entity extraction."""
+    with connect(project) as conn:
+        row = conn.execute(SELECT_MEMORY_BY_ID, [memory_id]).fetchone()
+        if not row:
+            return {"error": f"Memory '{memory_id}' not found"}
 
-    row = conn.execute(SELECT_MEMORY_BY_ID, [memory_id]).fetchone()
-    if not row:
-        return {"error": f"Memory '{memory_id}' not found"}
+        existing = row_to_dict(row, include_embedding=True)
+        updates = {}
+        changed_fields = []
 
-    existing = row_to_dict(row, include_embedding=True)
+        if title is not None:
+            updates["title"] = title; changed_fields.append("title")
+        if content is not None:
+            updates["content"] = content; changed_fields.append("content")
+        if tags is not None:
+            updates["tags"] = tags; changed_fields.append("tags")
+        if metadata is not None:
+            updates["metadata"] = json.dumps(metadata); changed_fields.append("metadata")
+        if status is not None:
+            updates["status"] = status; changed_fields.append("status")
+        if priority is not None:
+            updates["priority"] = priority; changed_fields.append("priority")
+        if related_ids is not None:
+            updates["related_ids"] = related_ids; changed_fields.append("related_ids")
 
-    updates = {}
-    changed_fields = []
+        if not updates:
+            return {"error": "No fields to update"}
 
-    if title is not None:
-        updates["title"] = title
-        changed_fields.append("title")
-    if content is not None:
-        updates["content"] = content
-        changed_fields.append("content")
-    if tags is not None:
-        updates["tags"] = tags
-        changed_fields.append("tags")
-    if metadata is not None:
-        updates["metadata"] = json.dumps(metadata)
-        changed_fields.append("metadata")
-    if status is not None:
-        updates["status"] = status
-        changed_fields.append("status")
-    if priority is not None:
-        updates["priority"] = priority
-        changed_fields.append("priority")
-    if related_ids is not None:
-        updates["related_ids"] = related_ids
-        changed_fields.append("related_ids")
+        if title is not None or content is not None:
+            new_title = title or existing["title"]
+            new_content = content or existing["content"]
+            updates["embedding"] = embed_text(prepare_embedding_text(new_title, new_content))
+            updates["summary"] = generate_summary(new_title, new_content)
+            updates["entities"] = extract_entities(f"{new_title} {new_content}")
 
-    if not updates:
-        return {"error": "No fields to update"}
+        set_parts = [f"{k} = ?" for k in updates]
+        set_parts.append("updated_at = current_timestamp")
+        values = list(updates.values()) + [memory_id]
 
-    # Re-embed, re-summarize, re-extract entities if title or content changed
-    if title is not None or content is not None:
-        new_title = title or existing["title"]
-        new_content = content or existing["content"]
-        embedding_text = prepare_embedding_text(new_title, new_content)
-        updates["embedding"] = embed_text(embedding_text)
-        updates["summary"] = generate_summary(new_title, new_content)
-        updates["entities"] = extract_entities(f"{new_title} {new_content}")
+        conn.execute(f"UPDATE memories SET {', '.join(set_parts)} WHERE id = ?", values)
+        row = conn.execute(SELECT_MEMORY_BY_ID, [memory_id]).fetchone()
 
-    # Build and execute UPDATE
-    set_parts = []
-    values = []
-    for key, value in updates.items():
-        set_parts.append(f"{key} = ?")
-        values.append(value)
-
-    set_parts.append("updated_at = current_timestamp")
-    values.append(memory_id)
-
-    sql = f"UPDATE memories SET {', '.join(set_parts)} WHERE id = ?"
-    conn.execute(sql, values)
-
-    # Record provenance
     record_provenance(project, memory_id, "update", {"changed_fields": changed_fields})
 
-    # Invalidate rules cache if needed
     cat = existing.get("category", "")
     try:
         if MemoryCategory(cat) in RULE_CATEGORIES:
@@ -93,5 +74,4 @@ def update_memory(
     except ValueError:
         pass
 
-    row = conn.execute(SELECT_MEMORY_BY_ID, [memory_id]).fetchone()
     return {"status": "ok", "memory": row_to_dict(row)}

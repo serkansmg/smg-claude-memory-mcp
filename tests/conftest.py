@@ -3,8 +3,8 @@
 import pytest
 
 from memory_mcp.config import settings
-from memory_mcp.db.connection import get_manager
 import memory_mcp.db.registry as registry_mod
+import memory_mcp.db.connection as conn_mod
 from memory_mcp.tools.rules import _rules_cache
 
 
@@ -15,19 +15,20 @@ def temp_data_dir(tmp_path):
     settings.data_dir = tmp_path / "memory-mcp"
     settings.ensure_dirs()
 
-    # Reset registry singleton so it uses the new data dir
-    registry_mod._registry_conn = None
+    # Reset registry schema flag
+    registry_mod._schema_initialized = False
+
+    # Reset connection initialized set
+    conn_mod._initialized_dbs.clear()
 
     # Clear rules cache
     _rules_cache.clear()
 
     yield tmp_path / "memory-mcp"
 
-    # Cleanup
-    get_manager().close_all()
-    if registry_mod._registry_conn is not None:
-        registry_mod._registry_conn.close()
-        registry_mod._registry_conn = None
+    # Reset
+    registry_mod._schema_initialized = False
+    conn_mod._initialized_dbs.clear()
     settings.data_dir = original
 
 
@@ -38,8 +39,5 @@ def project_slug():
 
 @pytest.fixture
 def initialized_project(project_slug):
-    """Create and return an initialized test project."""
     from memory_mcp.tools.project import init_project
-
-    result = init_project(project_slug, "Test Project", "A test project")
-    return result
+    return init_project(project_slug, "Test Project", "A test project")
