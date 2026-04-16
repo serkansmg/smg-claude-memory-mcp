@@ -114,6 +114,219 @@ The only network call is the one-time ~80MB download of the embedding model from
 
 ---
 
+## How It Works — The Flow
+
+Three interaction patterns. In all of them, **you talk to Claude normally** — the MCP works behind the scenes.
+
+### The Cast
+
+Before the flows, a quick clarification — these are **different things**:
+
+| Component | What it is | What it does |
+|-----------|-----------|--------------|
+| **Claude** (LLM) | Large language model | Understands you, makes decisions, writes answers |
+| **Memory MCP** | This server | Orchestrates storage and retrieval |
+| **Embedding model** (all-MiniLM) | Small neural net (~80MB) | Turns text into 384 numbers (a vector). Does NOT understand anything |
+| **DuckDB** | Local database | Stores memories + vectors, does similarity math |
+
+The embedding model is NOT an LLM. It doesn't "understand" — it just converts text to numbers so that similar meanings produce similar vectors. That's why it's small and fast.
+
+---
+
+### Flow 1: You ask a question
+
+> "What was our caching strategy?"
+
+```mermaid
+sequenceDiagram
+    actor You
+    participant Claude
+    participant MCP as Memory MCP
+    participant Embed as Embedding Model
+    participant DB as DuckDB
+
+    You->>Claude: "What was our caching strategy?"
+    Claude->>MCP: memory_search("caching strategy")
+    MCP->>Embed: encode(query)
+    Embed-->>MCP: [384-dim vector]
+    MCP->>DB: vector similarity search (cosine)
+    DB-->>MCP: top-N matching memories
+    MCP-->>Claude: [Redis for cache, decisions, ...]
+    Claude-->>You: "We chose Redis for session caching because..."
+```
+
+**What happened**: Claude triggered a vector search. The query became a vector. DuckDB found memories with similar vectors (same meaning). Claude composed the answer from those memories.
+
+---
+
+### Flow 2: You make a decision
+
+> "Let's use Redis for caching."
+
+```mermaid
+sequenceDiagram
+    actor You
+    participant Claude
+    participant Hook as UserPrompt Hook
+    participant MCP as Memory MCP
+    participant Embed as Embedding Model
+    participant DB as DuckDB
+
+    You->>Claude: "Let's use Redis for caching"
+    Hook->>Claude: detects decision pattern
+    Claude->>MCP: memory_store(decision, "Use Redis", content)
+    MCP->>Embed: encode(title + content)
+    Embed-->>MCP: [384-dim vector]
+    MCP->>MCP: generate summary, extract entities, compute TTL
+    MCP->>DB: INSERT memory + vector + metadata
+    DB-->>MCP: stored
+    MCP-->>Claude: {id, summary, entities, expires_at}
+    Claude-->>You: "Noted — Redis caching decision saved."
+```
+
+**What happened**: The UserPromptSubmit hook noticed a decision pattern. Claude auto-stored it. MCP generated a summary, extracted entities (like "Redis"), computed a TTL (365 days for decisions), and wrote everything to DuckDB along with the vector.
+
+---
+
+### Flow 3: You start a new conversation
+
+> "Hi, let's continue."
+
+```mermaid
+sequenceDiagram
+    actor You
+    participant Claude
+    participant Hook as SessionStart Hook
+    participant MCP as Memory MCP
+    participant DB as DuckDB
+
+    You->>Claude: "Hi, let's continue"
+    Hook->>Claude: enforces memory_session_start
+    Claude->>MCP: memory_session_start(project)
+    MCP->>DB: auto-close orphaned sessions
+    MCP->>DB: SELECT mandatory_rules, forbidden_rules
+    MCP->>DB: SELECT last session summary
+    MCP->>DB: SELECT active sprint goals
+    MCP->>DB: SELECT recent decisions (last 7 days)
+    DB-->>MCP: full context bundle
+    MCP-->>Claude: {rules, last_summary, sprint, decisions}
+    Claude-->>You: "Hi! Last session we chose Redis. Auth module is next."
+```
+
+**What happened**: The hook forced Claude to call `memory_session_start`. MCP pulled everything important in one batch — rules, last session summary, active sprint, recent decisions — and Claude started the conversation already knowing the project's state.
+
+---
+
+### High-Level View
+
+```mermaid
+graph LR
+    User[You] <--> Claude[Claude LLM]
+    Claude <--> MCP[Memory MCP Server]
+    MCP --> Embed[Embedding Model<br/>~80MB local]
+    MCP --> DB[(DuckDB<br/>per-project)]
+    DB --> HNSW[HNSW Vector Index]
+    Hooks[Hooks] -.->|enforce session_start,<br/>detect decisions| Claude
+
+    style User fill:#e1f5e1
+    style Claude fill:#fff4e1
+    style MCP fill:#e1e8ff
+    style Embed fill:#ffe1f0
+    style DB fill:#f0e1ff
+```
+
+Everything runs locally on your machine. No cloud, no API keys, no telemetry.
+
+---
+
+## Multilingual Support
+
+### The Default: English-Only
+
+Out of the box, this MCP uses **`all-MiniLM-L6-v2`** — a small, fast, **English-only** embedding model:
+
+- Size: ~80MB on disk, ~90MB RAM
+- Speed: ~14k sentences/sec on CPU
+- Languages: English only
+- Quality: Excellent for English
+
+**What this means in practice:**
+
+```
+✅ "which database did we choose?" → finds the PostgreSQL decision (English content)
+❌ "hangi veritabanını seçtik?"    → may return 0 results (Turkish query, English content)
+```
+
+If your memories are in English, the default works great. If you or your team write in other languages, you need the multilingual model.
+
+### Switching to Multilingual
+
+If you want to **ask questions** or **store memories** in non-English languages, switch to the multilingual model:
+
+```
+/smg-memory model multilingual
+```
+
+This will:
+1. Show you the impact (disk, RAM, memories to re-embed)
+2. Ask for confirmation
+3. Download the multilingual model (~470MB, one-time)
+4. Re-embed all your existing memories with the new model
+5. Persist the choice (survives restarts)
+
+After switching, you can search and store in **any of these 50+ languages**:
+
+| Region | Languages |
+|--------|-----------|
+| **European** | English, German, French, Spanish, Italian, Portuguese, Dutch, Polish, Swedish, Romanian, Czech, Danish, Finnish, Greek, Hungarian, Norwegian, Bulgarian, Catalan, Galician, Croatian, Slovak, Slovenian, Lithuanian, Latvian, Estonian, Ukrainian, Serbian, Macedonian, Albanian |
+| **Middle Eastern** | Arabic, Hebrew, Persian (Farsi), Kurdish, Armenian, Urdu |
+| **Asian** | Chinese, Japanese, Korean, Vietnamese, Thai, Indonesian, Malay, Burmese, Mongolian |
+| **South Asian** | Hindi, Gujarati, Marathi |
+| **Turkic** | **Turkish**, Azerbaijani (partial) |
+
+### Cross-Lingual Superpower
+
+The multilingual model is **cross-lingual** — you can store memories in one language and search in another:
+
+```
+Store (English):  "We chose PostgreSQL for JSON support and reliability"
+Search (Turkish): "hangi veritabanını kullanıyoruz?" → finds the PostgreSQL decision ✅
+Search (Japanese): "どのデータベースを使っていますか?" → finds it too ✅
+```
+
+### Comparison
+
+| | English-only (default) | Multilingual |
+|---|---|---|
+| Model | `all-MiniLM-L6-v2` | `paraphrase-multilingual-MiniLM-L12-v2` |
+| Disk | ~80MB | ~470MB |
+| RAM | ~90MB | ~500MB |
+| Parameters | 22M | 118M |
+| Speed | ~14k sent/sec | ~5k sent/sec |
+| Languages | English only | 50+ languages |
+| Cross-lingual | No | **Yes** |
+| Vector dimensions | 384 | 384 (same) |
+
+### Switching Back
+
+Want to go back to English-only?
+
+```
+/smg-memory model english
+```
+
+Same two-step confirmation, re-embeds all memories back.
+
+### Check Current Model
+
+```
+/smg-memory model
+```
+
+Shows which model is active and presents both options with their trade-offs.
+
+---
+
 ## Why Not Just Use `MEMORY.md`?
 
 Claude Code's built-in memory has real limitations:
@@ -330,20 +543,6 @@ When a session is active, Claude automatically:
 | `developer_docs` | Developer documentation | 180 days |
 | `feedback` | User feedback on assistant behavior | 90 days |
 | `reference` | Pointers to external resources | 365 days |
-
----
-
-## Multilingual Support
-
-Default: English-only, lightweight (~80MB, ~90MB RAM).
-
-To enable 50+ languages (including Turkish, Japanese, Arabic, etc.):
-
-```
-/smg-memory model multilingual
-```
-
-Trade-off: ~470MB disk, ~500MB RAM. No other changes — same 384-dim embeddings, same search quality for English.
 
 ---
 
