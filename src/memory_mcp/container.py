@@ -10,7 +10,7 @@ from memory_mcp.repositories import (
 from memory_mcp.services import (
     MemoryService, SearchService, RulesService, RulesCache,
     SessionService, ProjectService, PortableService,
-    ExportImportService, ModelService,
+    ExportImportService, ModelService, UpdateService,
 )
 
 
@@ -44,6 +44,7 @@ class Container:
             self.memory_repo, self.provenance_repo,
         )
         self.model_service = ModelService(self.memory_repo)
+        self.update_service = UpdateService()
 
 
 # Module-level singleton

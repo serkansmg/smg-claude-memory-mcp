@@ -8,6 +8,7 @@ from memory_mcp.services.project_service import ProjectService
 from memory_mcp.services.portable_service import PortableService
 from memory_mcp.services.export_import_service import ExportImportService
 from memory_mcp.services.model_service import ModelService
+from memory_mcp.services.update_service import UpdateService
 
 __all__ = [
     "MemoryService",
@@ -19,4 +20,5 @@ __all__ = [
     "PortableService",
     "ExportImportService",
     "ModelService",
+    "UpdateService",
 ]

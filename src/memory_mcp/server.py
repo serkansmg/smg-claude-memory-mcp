@@ -415,6 +415,20 @@ def memory_reembed(project: str | None = None) -> dict:
     return _safe(_run)
 
 
+# ---------- Updates ----------
+
+
+@mcp.tool()
+def memory_check_update() -> dict:
+    """Check if a newer version of the Memory MCP server is available.
+
+    Queries GitHub Releases first, falls back to git commit comparison.
+    Does NOT modify anything - it only reports. Returns step-by-step
+    update instructions when a new version is available.
+    """
+    return container.update_service.check()
+
+
 # ---------- Entrypoint ----------
 
 
