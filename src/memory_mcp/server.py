@@ -1,44 +1,58 @@
-"""FastMCP server - tool registration and entrypoint."""
+"""FastMCP server - thin tool layer over the service container.
+
+Each @mcp.tool() is a minimal wrapper:
+1. Resolve the project (explicit > active > CWD-detected)
+2. Build a request model from inputs
+3. Call the service method
+4. Return a dict response (or error)
+"""
 
 import os
 
 from fastmcp import FastMCP
 
-from memory_mcp.context import set_active_project, resolve_project, load_active_project
-from memory_mcp.tools.project import init_project, list_all_projects, get_project_info
-from memory_mcp.tools.store import store_memory
-from memory_mcp.tools.recall import recall_memory
-from memory_mcp.tools.search import search_memories
-from memory_mcp.tools.update import update_memory
-from memory_mcp.tools.delete import delete_memory
-from memory_mcp.tools.list_memories import list_memories
-from memory_mcp.tools.rules import get_rules
-from memory_mcp.tools.session import session_start, session_end
-from memory_mcp.db.provenance import get_provenance
-from memory_mcp.tools.portable import attach_project, make_portable, sync_from_portable
-from memory_mcp.tools.export_import import export_memories, import_memories
-from memory_mcp.tools.model_manager import get_model_info, set_model, reembed_project, load_persisted_model
+from memory_mcp.container import container
+from memory_mcp.context import (
+    load_active_project, resolve_project, set_active_project,
+)
+from memory_mcp.exceptions import MemoryMCPError
+from memory_mcp.models import (
+    MemoryCategory, StoreMemoryRequest, UpdateMemoryRequest, SearchRequest,
+    MemoryFilter, Pagination,
+)
 
-# Load persisted config before anything else
-load_persisted_model()
+# Load persisted state at startup
+container.model_service.load_persisted()
 load_active_project()
 
 mcp = FastMCP("memory-mcp")
 
 
+# ---------- Helpers ----------
+
+
 def _resolve(project: str | None) -> str:
-    """Resolve project slug: explicit > active > cwd-detected. Raises if none found."""
+    """Resolve project slug: explicit > active > CWD-detected. Raises if none."""
     slug = resolve_project(project, os.getcwd())
     if not slug:
         raise ValueError(
             "No project specified and none detected. "
-            "Use memory_use('slug') to set active project, "
-            "or pass project= explicitly."
+            "Use memory_use('slug') to set active project, or pass project= explicitly."
         )
     return slug
 
 
-# --- Version ---
+def _safe(fn):
+    """Wrap a tool body with uniform error handling."""
+    try:
+        return fn()
+    except MemoryMCPError as e:
+        return {"error": str(e), "type": type(e).__name__}
+    except ValueError as e:
+        return {"error": str(e), "type": "ValueError"}
+
+
+# ---------- Version ----------
 
 
 @mcp.tool()
@@ -58,24 +72,17 @@ def memory_version() -> dict:
     }
 
 
-# --- Active Project ---
+# ---------- Active Project ----------
 
 
 @mcp.tool()
 def memory_use(project: str) -> dict:
-    """Set the active project. After this, all other tools use this project by default.
-
-    No need to pass project= to every tool call anymore.
-    Also auto-detected from CWD if the project was attached via memory_attach_project.
-
-    Args:
-        project: Project slug to set as active
-    """
+    """Set the active project. Subsequent tools use it by default."""
     set_active_project(project)
-    return {"status": "ok", "active_project": project, "message": f"Active project set to '{project}'. All tools will use this project by default."}
+    return {"status": "ok", "active_project": project}
 
 
-# --- Project Management ---
+# ---------- Projects ----------
 
 
 @mcp.tool()
@@ -85,42 +92,34 @@ def memory_init_project(
     description: str | None = None,
     set_active: bool = True,
 ) -> dict:
-    """Initialize a new project memory namespace.
-
-    Creates a dedicated DuckDB database with vector search support.
-    Call this once per project before storing memories.
-    Automatically sets the project as active.
-
-    Args:
-        slug: URL-safe project identifier (e.g., 'my-web-app')
-        display_name: Human-readable project name
-        description: Optional project description
-        set_active: Set this project as active (default: True)
-    """
-    result = init_project(slug, display_name, description)
-    if set_active and result.get("status") == "ok":
-        set_active_project(slug)
-        result["active"] = True
-    return result
+    """Initialize a new project namespace (creates DuckDB + registers it)."""
+    def _run():
+        project = container.project_service.init_project(slug, display_name, description)
+        result = {"status": "ok", "project": project.model_dump(mode="json")}
+        if set_active:
+            set_active_project(project.slug)
+            result["active"] = True
+        return result
+    return _safe(_run)
 
 
 @mcp.tool()
 def memory_list_projects() -> dict:
-    """List all registered projects with their last access time."""
-    return list_all_projects()
+    """List all registered projects."""
+    projects = container.project_service.list_all()
+    return {"projects": [p.model_dump(mode="json") for p in projects]}
 
 
 @mcp.tool()
 def memory_project_info(project: str | None = None) -> dict:
-    """Get detailed info for a project.
+    """Get detailed info for a project."""
+    def _run():
+        p = container.project_service.get(_resolve(project))
+        return p.model_dump(mode="json")
+    return _safe(_run)
 
-    Args:
-        project: Project slug (optional if active project is set)
-    """
-    return get_project_info(_resolve(project))
 
-
-# --- Core Memory Operations ---
+# ---------- Memory CRUD ----------
 
 
 @mcp.tool()
@@ -135,32 +134,22 @@ def memory_store(
     source: str = "assistant",
     related_ids: list[str] | None = None,
 ) -> dict:
-    """Store a new memory with automatic vector embedding, summary, entity extraction, and TTL.
-
-    Categories: decision, session, sprint, project_plan, architecture, devops,
-    mandatory_rules, forbidden_rules, developer_docs, feedback, reference.
-
-    Auto-features:
-    - Vector embedding for semantic search
-    - 15-20 word summary generation
-    - Entity extraction (tech names, @mentions, #tags, acronyms)
-    - TTL/expiration based on category and priority
-    - Provenance audit trail
-
-    Rules (mandatory_rules, forbidden_rules) automatically get priority=2 and never expire.
-
-    Args:
-        category: Memory category
-        title: Short descriptive title
-        content: Full memory content
-        project: Project slug (optional if active project is set)
-        tags: Optional tags for filtering
-        metadata: Optional JSON metadata
-        priority: Priority level (0=normal, auto-set for rules)
-        source: Who created this (assistant, user, system)
-        related_ids: IDs of related memories
-    """
-    return store_memory(_resolve(project), category, title, content, tags, metadata, priority, source, related_ids)
+    """Store a new memory with auto-embedding, summary, entity extraction, and TTL."""
+    def _run():
+        req = StoreMemoryRequest(
+            project=_resolve(project),
+            category=MemoryCategory(category),
+            title=title,
+            content=content,
+            tags=tags or [],
+            metadata=metadata,
+            priority=priority,
+            source=source,
+            related_ids=related_ids or [],
+        )
+        memory = container.memory_service.store(req)
+        return {"status": "ok", "memory": memory.model_dump(mode="json")}
+    return _safe(_run)
 
 
 @mcp.tool()
@@ -174,26 +163,21 @@ def memory_search(
     min_similarity: float = 0.3,
     token_budget: int | None = None,
 ) -> dict:
-    """Semantic search across memories using vector similarity.
-
-    Uses HNSW-accelerated cosine similarity with composite relevance scoring
-    (similarity + recency + access frequency).
-
-    Supports token budgeting: when token_budget is set, returns a dual-phase response:
-    - index: all matches as summary-only (lightweight)
-    - details: top matches with full content, within token budget
-
-    Args:
-        query: Natural language search query
-        project: Project slug (optional if active project is set)
-        category: Optional category filter
-        tags: Optional tag filter (matches any)
-        status: Filter by status (default: active)
-        limit: Max results to return
-        min_similarity: Minimum cosine similarity threshold
-        token_budget: Optional max tokens for response content
-    """
-    return search_memories(_resolve(project), query, category, tags, status, limit, min_similarity, token_budget)
+    """Semantic search with composite relevance scoring."""
+    def _run():
+        req = SearchRequest(
+            project=_resolve(project),
+            query=query,
+            category=MemoryCategory(category) if category else None,
+            tags=tags,
+            status=status,
+            limit=limit,
+            min_similarity=min_similarity,
+            token_budget=token_budget,
+        )
+        response = container.search_service.search(req)
+        return response.model_dump(mode="json")
+    return _safe(_run)
 
 
 @mcp.tool()
@@ -202,16 +186,11 @@ def memory_recall(
     memory_id: str | None = None,
     title: str | None = None,
 ) -> dict:
-    """Recall a specific memory by ID or exact title.
-
-    Increments the access counter and records provenance.
-
-    Args:
-        project: Project slug (optional if active project is set)
-        memory_id: Exact memory UUID
-        title: Exact title match
-    """
-    return recall_memory(_resolve(project), memory_id, title)
+    """Recall a specific memory by ID or exact title."""
+    def _run():
+        memory = container.memory_service.recall(_resolve(project), memory_id, title)
+        return {"memory": memory.model_dump(mode="json")}
+    return _safe(_run)
 
 
 @mcp.tool()
@@ -226,23 +205,16 @@ def memory_update(
     priority: int | None = None,
     related_ids: list[str] | None = None,
 ) -> dict:
-    """Update an existing memory. Only provided fields are changed.
-
-    Automatically re-generates embedding, summary, and entities if title or content changes.
-    Records all changes in the provenance audit trail.
-
-    Args:
-        memory_id: ID of memory to update
-        project: Project slug (optional if active project is set)
-        title: New title (triggers re-embedding)
-        content: New content (triggers re-embedding)
-        tags: Replace tags
-        metadata: Replace metadata
-        status: New status (active, archived)
-        priority: New priority
-        related_ids: Replace related IDs
-    """
-    return update_memory(_resolve(project), memory_id, title, content, tags, metadata, status, priority, related_ids)
+    """Update an existing memory. Re-embeds if title/content changed."""
+    def _run():
+        req = UpdateMemoryRequest(
+            project=_resolve(project), memory_id=memory_id,
+            title=title, content=content, tags=tags, metadata=metadata,
+            status=status, priority=priority, related_ids=related_ids,
+        )
+        memory = container.memory_service.update(req)
+        return {"status": "ok", "memory": memory.model_dump(mode="json")}
+    return _safe(_run)
 
 
 @mcp.tool()
@@ -252,17 +224,12 @@ def memory_delete(
     hard: bool = False,
     reason: str | None = None,
 ) -> dict:
-    """Delete a memory. Soft-delete (archive) by default.
-
-    Records deletion in provenance audit trail with optional reason.
-
-    Args:
-        memory_id: ID of memory to delete
-        project: Project slug (optional if active project is set)
-        hard: If True, permanently removes the memory
-        reason: Optional reason for deletion
-    """
-    return delete_memory(_resolve(project), memory_id, hard, reason)
+    """Soft-delete (archive) or hard-delete a memory."""
+    def _run():
+        return container.memory_service.delete(
+            _resolve(project), memory_id, hard=hard, reason=reason,
+        )
+    return _safe(_run)
 
 
 @mcp.tool()
@@ -276,85 +243,62 @@ def memory_list(
     limit: int = 50,
     offset: int = 0,
 ) -> dict:
-    """List memories with filtering, sorting, and pagination.
-
-    Uses direct SQL queries, not vector search.
-    Automatically cleans up expired memories.
-
-    Args:
-        project: Project slug (optional if active project is set)
-        category: Filter by category
-        status: Filter by status (default: active)
-        tags: Filter by tags (matches any)
-        sort_by: Sort field (updated_at, created_at, title, priority, access_count)
-        sort_order: asc or desc
-        limit: Page size
-        offset: Page offset
-    """
-    return list_memories(_resolve(project), category, status, tags, sort_by, sort_order, limit, offset)
+    """List memories with filtering, sorting, and pagination."""
+    def _run():
+        slug = _resolve(project)
+        filters = MemoryFilter(status=status, category=category, tags=tags)
+        pagination = Pagination(
+            limit=limit, offset=offset, sort_by=sort_by, sort_order=sort_order,
+        )
+        memories, total = container.memory_repo.list(slug, filters, pagination)
+        return {
+            "memories": [m.model_dump(mode="json") for m in memories],
+            "total": total, "limit": limit, "offset": offset,
+        }
+    return _safe(_run)
 
 
-# --- Provenance / Audit ---
+# ---------- Provenance ----------
 
 
 @mcp.tool()
-def memory_provenance(
-    memory_id: str,
-    project: str | None = None,
-) -> dict:
-    """Get the full audit trail for a memory.
-
-    Returns all operations (create, update, delete, access) with timestamps.
-
-    Args:
-        memory_id: ID of memory to audit
-        project: Project slug (optional if active project is set)
-    """
-    slug = _resolve(project)
-    trail = get_provenance(slug, memory_id)
-    return {"memory_id": memory_id, "provenance": trail, "total": len(trail)}
+def memory_provenance(memory_id: str, project: str | None = None) -> dict:
+    """Get the full audit trail for a memory."""
+    def _run():
+        slug = _resolve(project)
+        entries = container.provenance_repo.for_memory(slug, memory_id)
+        return {
+            "memory_id": memory_id,
+            "provenance": [e.model_dump(mode="json") for e in entries],
+            "total": len(entries),
+        }
+    return _safe(_run)
 
 
-# --- Rules ---
+# ---------- Rules ----------
 
 
 @mcp.tool()
 def memory_get_rules(project: str | None = None) -> dict:
-    """Get all mandatory and forbidden rules for a project.
-
-    Uses direct SQL (not vector search) with in-memory caching.
-    Rules are ALWAYS returned completely - never approximated.
-
-    IMPORTANT: Call this before performing any operation to ensure
-    mandatory rules are followed and forbidden patterns are avoided.
-
-    Args:
-        project: Project slug (optional if active project is set)
-    """
-    return get_rules(_resolve(project))
+    """Get all mandatory and forbidden rules (direct SQL, cached)."""
+    def _run():
+        response = container.rules_service.get_rules(_resolve(project))
+        return response.model_dump(mode="json")
+    return _safe(_run)
 
 
-# --- Session Management ---
+# ---------- Sessions ----------
 
 
 @mcp.tool()
 def memory_session_start(project: str | None = None) -> dict:
-    """Start a new session and load full project context.
-
-    Returns in a single call:
-    - All mandatory and forbidden rules
-    - Last session summary
-    - Active sprint goals
-    - Recent decisions (last 7 days)
-
-    Call this at the beginning of every conversation.
-
-    Args:
-        project: Project slug (optional if active project is set)
-    """
-    slug = _resolve(project)
-    set_active_project(slug)  # Auto-activate on session start
-    return session_start(slug)
+    """Start a session. Loads rules, last summary, sprint goals, recent decisions."""
+    def _run():
+        slug = _resolve(project)
+        set_active_project(slug)
+        ctx = container.session_service.start(slug)
+        return ctx.model_dump(mode="json")
+    return _safe(_run)
 
 
 @mcp.tool()
@@ -365,21 +309,16 @@ def memory_session_end(
     memories_created: int = 0,
     memories_accessed: int = 0,
 ) -> dict:
-    """End a session and store its summary.
-
-    The summary will be shown to the next session via memory_session_start.
-
-    Args:
-        session_id: Session ID from memory_session_start
-        summary: Session summary text
-        project: Project slug (optional if active project is set)
-        memories_created: Count of memories created this session
-        memories_accessed: Count of memories accessed this session
-    """
-    return session_end(_resolve(project), session_id, summary, memories_created, memories_accessed)
+    """End a session and store its summary."""
+    def _run():
+        return container.session_service.end(
+            _resolve(project), session_id, summary,
+            memories_created, memories_accessed,
+        )
+    return _safe(_run)
 
 
-# --- Project Portability ---
+# ---------- Portability ----------
 
 
 @mcp.tool()
@@ -389,23 +328,18 @@ def memory_attach_project(
     display_name: str | None = None,
     description: str | None = None,
 ) -> dict:
-    """Attach an existing project directory to the memory system.
-
-    If the directory already has a .memory-mcp.duckdb file, uses that.
-    Otherwise creates a new memory DB for the project.
-    Automatically sets the project as active.
-
-    Args:
-        project_path: Absolute path to the project directory
-        slug: Optional slug (auto-derived from directory name)
-        display_name: Optional display name
-        description: Optional description
-    """
-    result = attach_project(project_path, slug, display_name, description)
-    if result.get("status") == "ok" and result.get("project", {}).get("slug"):
-        set_active_project(result["project"]["slug"])
-        result["active"] = True
-    return result
+    """Attach an existing project directory. Auto-activates on success."""
+    def _run():
+        result = container.portable_service.attach(
+            project_path, slug, display_name, description,
+        )
+        if result.get("status") == "ok":
+            project_slug = result.get("project", {}).get("slug")
+            if project_slug:
+                set_active_project(project_slug)
+                result["active"] = True
+        return result
+    return _safe(_run)
 
 
 @mcp.tool()
@@ -413,94 +347,51 @@ def memory_make_portable(
     project_path: str,
     project: str | None = None,
 ) -> dict:
-    """Move a project's memory DB into the project directory for git sharing.
-
-    After this, the DB lives at <project_path>/.memory-mcp.duckdb.
-    Commit this file to git so teammates can use it on other machines.
-
-    Remember to add *.duckdb.wal to .gitignore.
-
-    Args:
-        project_path: Absolute path to the project directory
-        project: Project slug (optional if active project is set)
-    """
-    return make_portable(_resolve(project), project_path)
+    """Move the project's DB into the project directory for git sharing."""
+    def _run():
+        return container.portable_service.make_portable(_resolve(project), project_path)
+    return _safe(_run)
 
 
 @mcp.tool()
-def memory_sync(
-    project_path: str,
-    slug: str | None = None,
-) -> dict:
-    """Sync a portable memory DB after git pull on a new machine.
-
-    Registers the .memory-mcp.duckdb found in the project directory
-    so the MCP can pick up right where the last user left off.
-    Automatically sets the project as active.
-
-    Args:
-        project_path: Absolute path to the project directory
-        slug: Optional slug (auto-derived from directory name)
-    """
-    result = sync_from_portable(project_path, slug)
-    if result.get("status") == "ok" and result.get("project", {}).get("slug"):
-        set_active_project(result["project"]["slug"])
-    return result
+def memory_sync(project_path: str, slug: str | None = None) -> dict:
+    """Sync a portable DB after git pull. Auto-activates on success."""
+    def _run():
+        result = container.portable_service.sync(project_path, slug)
+        if result.get("status") == "ok":
+            project_slug = result.get("project", {}).get("slug")
+            if project_slug:
+                set_active_project(project_slug)
+        return result
+    return _safe(_run)
 
 
-# --- Export / Import ---
+# ---------- Export / Import ----------
 
 
 @mcp.tool()
-def memory_export(
-    export_path: str,
-    project: str | None = None,
-) -> dict:
-    """Export all memories to human-readable .md files.
-
-    Creates a .memory/ directory in the project with:
-    - MEMORY_INDEX.md (master index)
-    - <category>/<title>.md (individual memory files)
-    - README.md (format documentation)
-
-    These files can be read and edited by anyone, even without the MCP.
-    Use memory_import to sync changes back.
-
-    Args:
-        export_path: Path to the project directory
-        project: Project slug (optional if active project is set)
-    """
-    return export_memories(_resolve(project), export_path)
+def memory_export(export_path: str, project: str | None = None) -> dict:
+    """Export all active memories to human-readable .md files."""
+    def _run():
+        return container.export_import_service.export(_resolve(project), export_path)
+    return _safe(_run)
 
 
 @mcp.tool()
-def memory_import(
-    import_path: str,
-    project: str | None = None,
-) -> dict:
-    """Import memories from exported .md files into the DB.
-
-    Reads the .memory/ directory in the project.
-    Creates new memories, updates changed ones, skips unchanged ones.
-
-    Args:
-        import_path: Path to the project directory
-        project: Project slug (optional if active project is set)
-    """
-    return import_memories(_resolve(project), import_path)
+def memory_import(import_path: str, project: str | None = None) -> dict:
+    """Import memories from exported .md files."""
+    def _run():
+        return container.export_import_service.import_from(_resolve(project), import_path)
+    return _safe(_run)
 
 
-# --- Model Management ---
+# ---------- Model Management ----------
 
 
 @mcp.tool()
 def memory_model_info() -> dict:
-    """Get current embedding model info and available presets.
-
-    Shows: current model, available presets (english/multilingual),
-    disk usage, RAM usage, supported languages, and speed.
-    """
-    return get_model_info()
+    """Current embedding model + available presets."""
+    return container.model_service.info()
 
 
 @mcp.tool()
@@ -509,35 +400,22 @@ def memory_set_model(
     project: str | None = None,
     confirm: bool = False,
 ) -> dict:
-    """Switch embedding model between english-only and multilingual.
-
-    Presets:
-    - 'english': all-MiniLM-L6-v2 (~80MB disk, ~90MB RAM, English only, very fast)
-    - 'multilingual': paraphrase-multilingual-MiniLM-L12-v2 (~470MB disk, ~500MB RAM, 50+ languages incl. Turkish)
-
-    First call without confirm=True shows the impact (disk, RAM, re-embed count).
-    Second call with confirm=True applies the change and re-embeds existing memories.
-
-    Args:
-        preset: 'english' or 'multilingual'
-        project: If provided, re-embed this project's memories after switching
-        confirm: Must be True to proceed after reviewing the impact
-    """
-    return set_model(preset, _resolve(project) if project else None, confirm)
+    """Switch embedding model between 'english' and 'multilingual' presets."""
+    def _run():
+        slug = _resolve(project) if project else None
+        return container.model_service.set_model(preset, slug, confirm)
+    return _safe(_run)
 
 
 @mcp.tool()
-def memory_reembed(
-    project: str | None = None,
-) -> dict:
-    """Re-embed all active memories in a project with the current model.
+def memory_reembed(project: str | None = None) -> dict:
+    """Re-embed all active memories with the current model."""
+    def _run():
+        return container.model_service.reembed(_resolve(project))
+    return _safe(_run)
 
-    Use after switching embedding models to update all vectors.
 
-    Args:
-        project: Project slug (optional if active project is set)
-    """
-    return reembed_project(_resolve(project))
+# ---------- Entrypoint ----------
 
 
 def main():

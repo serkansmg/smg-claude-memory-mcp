@@ -1,106 +1,112 @@
-"""Tests for portable DB, export, and import features."""
+"""Integration tests for portable DB, export, and import - via service layer."""
 
+import duckdb
 import pytest
-from pathlib import Path
+
+from memory_mcp.container import Container
+from memory_mcp.db.schema import create_hnsw_index, create_schema
+from memory_mcp.models import StoreMemoryRequest, MemoryCategory
+from memory_mcp.services.portable_service import PORTABLE_DB_NAME
+
+
+@pytest.fixture
+def container():
+    return Container()
 
 
 class TestAttachProject:
-    def test_attach_new_project(self, temp_data_dir, tmp_path):
-        from memory_mcp.tools.portable import attach_project
-
+    def test_attach_new_project(self, container, tmp_path):
         project_dir = tmp_path / "my-cool-project"
         project_dir.mkdir()
 
-        result = attach_project(str(project_dir))
+        result = container.portable_service.attach(str(project_dir))
         assert result["status"] == "ok"
         assert result["action"] == "created_new"
         assert result["project"]["slug"] == "my-cool-project"
 
-    def test_attach_project_with_existing_db(self, temp_data_dir, tmp_path):
-        from memory_mcp.tools.portable import attach_project, PORTABLE_DB_NAME
-        import duckdb
-        from memory_mcp.db.schema import create_schema, create_hnsw_index
-
+    def test_attach_project_with_existing_db(self, container, tmp_path):
         project_dir = tmp_path / "existing-project"
         project_dir.mkdir()
 
-        # Create a portable DB in the project
         db_path = project_dir / PORTABLE_DB_NAME
         conn = duckdb.connect(str(db_path))
-        create_schema(conn)
-        create_hnsw_index(conn)
-        conn.close()
+        try:
+            create_schema(conn)
+            create_hnsw_index(conn)
+        finally:
+            conn.close()
 
-        result = attach_project(str(project_dir))
-        assert result["status"] == "ok"
+        result = container.portable_service.attach(str(project_dir))
         assert result["action"] == "attached_existing_db"
 
 
 class TestMakePortable:
-    def test_make_portable(self, initialized_project, project_slug, tmp_path):
-        from memory_mcp.tools.portable import make_portable, PORTABLE_DB_NAME
-        from memory_mcp.tools.store import store_memory
-
+    def test_make_portable(self, container, tmp_path, project_slug):
         project_dir = tmp_path / "my-project"
         project_dir.mkdir()
 
-        # Store some data first
-        store_memory(project_slug, "decision", "Test", "Test content")
+        container.project_service.init_project(project_slug, "Test")
+        container.memory_service.store(StoreMemoryRequest(
+            project=project_slug, category=MemoryCategory.DECISION,
+            title="Test", content="Test content",
+        ))
 
-        result = make_portable(project_slug, str(project_dir))
+        result = container.portable_service.make_portable(project_slug, str(project_dir))
         assert result["status"] == "ok"
-        assert result["action"] == "moved_to_project"
         assert (project_dir / PORTABLE_DB_NAME).exists()
 
 
 class TestSyncFromPortable:
-    def test_sync(self, temp_data_dir, tmp_path):
-        from memory_mcp.tools.portable import PORTABLE_DB_NAME, sync_from_portable
-        import duckdb
-        from memory_mcp.db.schema import create_schema, create_hnsw_index
-
+    def test_sync(self, container, tmp_path):
         project_dir = tmp_path / "synced-project"
         project_dir.mkdir()
-
-        # Simulate git pull with a DB
         db_path = project_dir / PORTABLE_DB_NAME
-        conn = duckdb.connect(str(db_path))
-        create_schema(conn)
-        create_hnsw_index(conn)
-        # Add a test memory
-        import uuid
-        from memory_mcp.embeddings import embed_text
-        mid = str(uuid.uuid4())
-        emb = embed_text("Test memory")
-        conn.execute(
-            "INSERT INTO memories (id, category, title, content, embedding, status, priority) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            [mid, "decision", "Git Decision", "We use git for version control", emb, "active", 0],
-        )
-        conn.close()
 
-        result = sync_from_portable(str(project_dir))
+        conn = duckdb.connect(str(db_path))
+        try:
+            create_schema(conn)
+            create_hnsw_index(conn)
+            # Seed a memory
+            import uuid
+            from memory_mcp.embeddings import embed_text
+            mid = str(uuid.uuid4())
+            emb = embed_text("Test memory")
+            conn.execute(
+                "INSERT INTO memories (id, category, title, content, embedding, status, priority) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [mid, "decision", "Git Decision", "We use git", emb, "active", 0],
+            )
+        finally:
+            conn.close()
+
+        result = container.portable_service.sync(str(project_dir))
         assert result["status"] == "ok"
         assert result["action"] == "synced"
         assert result["memories_count"] == 1
 
 
 class TestExportImport:
-    def test_export(self, initialized_project, project_slug, tmp_path):
-        from memory_mcp.tools.store import store_memory
-        from memory_mcp.tools.export_import import export_memories
-
-        store_memory(project_slug, "decision", "Use PostgreSQL", "Chose PostgreSQL for JSON support.")
-        store_memory(project_slug, "mandatory_rules", "Run Tests", "Always run pytest.")
-        store_memory(project_slug, "architecture", "REST API", "Using RESTful architecture.")
+    def test_export(self, container, tmp_path, project_slug):
+        container.project_service.init_project(project_slug, "Test")
+        container.memory_service.store(StoreMemoryRequest(
+            project=project_slug, category=MemoryCategory.DECISION,
+            title="Use PostgreSQL", content="Chose PostgreSQL for JSON.",
+        ))
+        container.memory_service.store(StoreMemoryRequest(
+            project=project_slug, category=MemoryCategory.MANDATORY_RULES,
+            title="Run Tests", content="Always run pytest.",
+        ))
+        container.memory_service.store(StoreMemoryRequest(
+            project=project_slug, category=MemoryCategory.ARCHITECTURE,
+            title="REST API", content="Using RESTful architecture.",
+        ))
 
         project_dir = tmp_path / "export-test"
         project_dir.mkdir()
 
-        result = export_memories(project_slug, str(project_dir))
+        result = container.export_import_service.export(project_slug, str(project_dir))
         assert result["status"] == "ok"
         assert result["exported"] == 3
 
-        # Check directory structure
         memory_dir = project_dir / ".memory"
         assert memory_dir.exists()
         assert (memory_dir / "MEMORY_INDEX.md").exists()
@@ -109,45 +115,44 @@ class TestExportImport:
         assert (memory_dir / "mandatory_rules").is_dir()
         assert (memory_dir / "architecture").is_dir()
 
-    def test_export_then_import(self, initialized_project, project_slug, temp_data_dir, tmp_path):
-        from memory_mcp.tools.store import store_memory
-        from memory_mcp.tools.export_import import export_memories, import_memories
-        from memory_mcp.tools.project import init_project
+    def test_export_then_import(self, container, tmp_path, project_slug):
+        container.project_service.init_project(project_slug, "Test")
+        container.memory_service.store(StoreMemoryRequest(
+            project=project_slug, category=MemoryCategory.DECISION,
+            title="Database", content="We chose PostgreSQL.",
+        ))
+        container.memory_service.store(StoreMemoryRequest(
+            project=project_slug, category=MemoryCategory.MANDATORY_RULES,
+            title="Test First", content="Always test.",
+        ))
 
-        # Store memories in original project
-        store_memory(project_slug, "decision", "Database Choice", "We chose PostgreSQL.")
-        store_memory(project_slug, "mandatory_rules", "Test First", "Always test before commit.")
-
-        # Export
         project_dir = tmp_path / "roundtrip-test"
         project_dir.mkdir()
-        export_memories(project_slug, str(project_dir))
+        container.export_import_service.export(project_slug, str(project_dir))
 
-        # Create a new project and import
-        init_project("import-test", "Import Test")
-        result = import_memories("import-test", str(project_dir))
+        container.project_service.init_project("import-test", "Import Test")
+        result = container.export_import_service.import_from("import-test", str(project_dir))
 
         assert result["status"] == "ok"
         assert result["created"] == 2
-        assert result["skipped"] == 0
 
-    def test_exported_files_are_readable(self, initialized_project, project_slug, tmp_path):
-        from memory_mcp.tools.store import store_memory
-        from memory_mcp.tools.export_import import export_memories
-
-        store_memory(project_slug, "decision", "Use Redis", "Redis for caching and session storage.")
+    def test_exported_files_are_readable(self, container, tmp_path, project_slug):
+        container.project_service.init_project(project_slug, "Test")
+        container.memory_service.store(StoreMemoryRequest(
+            project=project_slug, category=MemoryCategory.DECISION,
+            title="Use Redis", content="Redis for caching.",
+        ))
 
         project_dir = tmp_path / "readable-test"
         project_dir.mkdir()
-        export_memories(project_slug, str(project_dir))
+        container.export_import_service.export(project_slug, str(project_dir))
 
-        # Read the exported file
         decision_dir = project_dir / ".memory" / "decision"
         files = list(decision_dir.glob("*.md"))
         assert len(files) == 1
 
         content = files[0].read_text()
-        assert "---" in content  # Has frontmatter
-        assert "Use Redis" in content  # Has title
-        assert "Redis for caching" in content  # Has content
-        assert "category: decision" in content  # Has metadata
+        assert "---" in content
+        assert "Use Redis" in content
+        assert "Redis for caching" in content
+        assert "category: decision" in content

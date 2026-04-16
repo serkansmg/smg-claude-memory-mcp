@@ -21,8 +21,8 @@ _initialized_dbs: set[str] = set()
 def _resolve_db_path(slug: str) -> Path:
     """Resolve DB path: check registry for custom path, fallback to central store."""
     try:
-        from memory_mcp.db.registry import get_project
-        project = get_project(slug)
+        from memory_mcp.repositories import ProjectRepository
+        project = ProjectRepository().get(slug)
         if project and project.db_path:
             custom_path = Path(project.db_path)
             if custom_path.parent.exists():

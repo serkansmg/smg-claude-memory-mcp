@@ -5,7 +5,7 @@ import threading
 from pathlib import Path
 
 from memory_mcp.config import settings
-from memory_mcp.tools.portable import PORTABLE_DB_NAME
+from memory_mcp.services.portable_service import PORTABLE_DB_NAME
 
 _active_project: str | None = None
 _lock = threading.Lock()
@@ -86,14 +86,14 @@ def get_active_project(cwd: str | None = None) -> str | None:
 
 def _slug_from_path(path: Path) -> str | None:
     """Try to find a registered project matching this path."""
-    from memory_mcp.db.registry import list_projects
+    from memory_mcp.repositories import ProjectRepository
     from memory_mcp.utils.text import slugify
 
     dir_name = path.name
     dir_slug = slugify(dir_name)
 
     try:
-        projects = list_projects()
+        projects = ProjectRepository().list_all()
         for p in projects:
             if p.slug == dir_slug:
                 return p.slug
