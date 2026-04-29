@@ -1,5 +1,7 @@
 """Memory repository - all SQL for memory CRUD, search, and filtering."""
 
+from __future__ import annotations
+
 import json
 from datetime import datetime
 
